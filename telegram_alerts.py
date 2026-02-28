@@ -1,15 +1,21 @@
 """
 telegram_alerts.py — Send formatted opportunity alerts to Telegram.
 
-Message format (per alert):
+Only alerts that pass the quality filter (MIN_CONFIDENCE + ALLOWED_ACTIONS
+from config.py) are ever sent.  By default this means only HIGH-confidence
+BUY YES or BUY NO signals reach Linda's Telegram.
+
+Message format:
 
   🟢 BUY YES  |  🔥 Confidence: HIGH  |  Bet: MEDIUM ($20–50)
-  ─────────────────────────────────────────────────────────────
+  ⚖️ Potential Mispricing
+  ────────────────────────────────
   📋 Market: Will X happen by March?
-  💰 Odds: YES 35¢ / NO 65¢  |  Estimated edge: ~15%
+  💰 Odds: YES 35¢ / NO 65¢
+     Estimated edge: ~15%
 
   💡 Why this is an opportunity:
-  News just broke that [reason]. Odds haven't adjusted yet. Buy YES before it moves up.
+  Odds haven't adjusted yet. Buy YES before it moves up.
 
   ⚠️ Risk: Low liquidity — keep bets small.
 
@@ -26,9 +32,12 @@ import telegram
 from telegram.constants import ParseMode
 
 import config
-from detectors import Alert, ACTION_EMOJI, CONFIDENCE_EMOJI, Action, Confidence
+from detectors import Alert, ACTION_EMOJI, CONFIDENCE_EMOJI
 
 logger = logging.getLogger(__name__)
+
+# ── Confidence ordering (higher index = higher confidence) ────────────────────
+_CONFIDENCE_RANK = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
 
 # ── Cooldown state ────────────────────────────────────────────────────────────
 _cooldowns: dict[str, float] = {}
@@ -50,6 +59,30 @@ def _cleanup_cooldowns() -> None:
         del _cooldowns[k]
 
 
+# ── Quality filter ────────────────────────────────────────────────────────────
+
+def _passes_quality_filter(alert: Alert) -> bool:
+    """
+    Return True only if the alert meets both the minimum confidence level
+    and is one of the allowed action types.
+
+    Controlled by config.MIN_CONFIDENCE and config.ALLOWED_ACTIONS.
+    Default: HIGH confidence + BUY YES or BUY NO only.
+    """
+    # Check confidence level
+    min_rank = _CONFIDENCE_RANK.get(config.MIN_CONFIDENCE.upper(), 2)
+    alert_rank = _CONFIDENCE_RANK.get(alert.confidence.upper(), 0)
+    if alert_rank < min_rank:
+        return False
+
+    # Check action type
+    allowed = {a.strip().upper() for a in config.ALLOWED_ACTIONS.split(",")}
+    if alert.action.upper() not in allowed:
+        return False
+
+    return True
+
+
 # ── Signal type display names ─────────────────────────────────────────────────
 SIGNAL_LABELS = {
     "odds_shift":   "📊 Sudden Odds Shift",
@@ -63,67 +96,48 @@ SIGNAL_LABELS = {
 # ── HTML helpers ──────────────────────────────────────────────────────────────
 
 def _esc(text: str) -> str:
-    """Escape Telegram HTML special characters."""
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _trunc(text: str, max_len: int) -> str:
-    """Truncate text to max_len characters, appending ellipsis if needed."""
     return text if len(text) <= max_len else text[:max_len - 1] + "…"
 
 
 # ── Message formatter ─────────────────────────────────────────────────────────
 
 def format_alert_html(alert: Alert) -> str:
-    """
-    Build a rich HTML message for a single Alert.
-
-    Layout:
-      Header line  — action badge, confidence badge, bet size
-      Divider
-      Market name
-      Odds + estimated edge
-      Blank line
-      Plain-English explanation
-      Risk note (if any)
-      Polymarket link
-    """
+    """Build a rich HTML message for a single Alert."""
     action_emoji     = ACTION_EMOJI.get(alert.action, "⚪")
     confidence_emoji = CONFIDENCE_EMOJI.get(alert.confidence, "📌")
     signal_label     = SIGNAL_LABELS.get(alert.signal_type, alert.signal_type)
 
-    # ── Header ────────────────────────────────────────────────────────────────
     header = (
         f"{action_emoji} <b>{_esc(alert.action)}</b>  |  "
         f"{confidence_emoji} Confidence: <b>{_esc(alert.confidence)}</b>  |  "
         f"Bet: <b>{_esc(alert.bet_size)}</b>"
     )
 
-    # ── Signal type tag ───────────────────────────────────────────────────────
-    tag = f"<i>{signal_label}</i>"
-
-    # ── Market + odds ─────────────────────────────────────────────────────────
+    tag         = f"<i>{signal_label}</i>"
     market_line = f"📋 <b>Market:</b> {_esc(_trunc(alert.market_question, 120))}"
-    odds_line   = f"💰 <b>Odds:</b> {_esc(alert.current_odds)}"
 
-    # Edge estimate (only show if meaningful)
+    odds = _esc(alert.current_odds)
+    if len(odds) > 300:
+        odds = odds[:297] + "…"
+    odds_line = f"💰 <b>Odds:</b> {odds}"
+
     edge = alert.edge_pct
     edge_line = f"   <i>Estimated edge: ~{edge:.0f}%</i>" if edge >= 3 else ""
 
-    # ── Explanation ───────────────────────────────────────────────────────────
-    explanation = _esc(_trunc(alert.explanation, 500))
-    why_block   = f"💡 <b>Why this is an opportunity:</b>\n{explanation}"
+    reason = _esc(_trunc(alert.explanation, 500))
+    why_block = f"💡 <b>Why this is an opportunity:</b>\n{reason}"
 
-    # ── Risk note ─────────────────────────────────────────────────────────────
     risk_block = ""
     if alert.risk_note:
-        risk_text = _esc(_trunc(alert.risk_note, 300))
+        risk_text  = _esc(_trunc(alert.risk_note, 300))
         risk_block = f"\n⚠️ <b>Risk:</b> {risk_text}"
 
-    # ── Link ──────────────────────────────────────────────────────────────────
     link = f'🔗 <a href="{alert.market_url}">View on Polymarket</a>'
 
-    # ── Assemble ──────────────────────────────────────────────────────────────
     parts = [header, tag, "─" * 32, market_line, odds_line]
     if edge_line:
         parts.append(edge_line)
@@ -152,20 +166,37 @@ async def _send_async(bot: telegram.Bot, text: str) -> bool:
 
 
 def send_alerts(alerts: list[Alert]) -> int:
-    """Send a batch of alerts, respecting cooldowns. Returns count sent."""
+    """
+    Filter alerts by quality, then send those that pass and aren't on cooldown.
+    Returns the count of alerts actually sent.
+    """
     if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
         logger.warning("Telegram not configured — printing to console.")
         for a in alerts:
-            _print_console(a)
+            if _passes_quality_filter(a):
+                _print_console(a)
         return 0
 
-    actionable = [a for a in alerts if not _is_on_cooldown(a)]
+    # Apply quality filter first
+    qualified = [a for a in alerts if _passes_quality_filter(a)]
+    skipped_quality = len(alerts) - len(qualified)
+
+    # Then apply cooldown filter
+    actionable = [a for a in qualified if not _is_on_cooldown(a)]
+    skipped_cooldown = len(qualified) - len(actionable)
+
+    logger.info(
+        "Alert filter: %d total → %d pass quality (HIGH+BUY) → %d not on cooldown → sending.",
+        len(alerts), len(qualified), len(actionable),
+    )
+    if skipped_quality:
+        logger.debug("  Skipped %d alerts (LOW/MEDIUM confidence or WATCH/SKIP action).",
+                     skipped_quality)
+    if skipped_cooldown:
+        logger.debug("  Skipped %d alerts (cooldown active).", skipped_cooldown)
+
     if not actionable:
-        logger.debug("All %d alerts on cooldown.", len(alerts))
         return 0
-
-    logger.info("Sending %d alerts (%d on cooldown).",
-                len(actionable), len(alerts) - len(actionable))
 
     bot  = telegram.Bot(token=config.TELEGRAM_BOT_TOKEN)
     sent = 0
@@ -186,27 +217,31 @@ def send_alerts(alerts: list[Alert]) -> int:
 
 
 def send_startup_message() -> None:
-    """Notify Linda that the bot is online."""
+    """Notify Linda that the bot is online and show active filter settings."""
     if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
         logger.info("Telegram not configured — skipping startup message.")
         return
+
+    allowed_actions = config.ALLOWED_ACTIONS or "BUY YES,BUY NO"
+    min_conf        = config.MIN_CONFIDENCE or "HIGH"
 
     bot  = telegram.Bot(token=config.TELEGRAM_BOT_TOKEN)
     text = (
         "<b>🤖 Polymarket Alert Bot — Online</b>\n\n"
         f"Polling every <b>{config.POLL_INTERVAL_SECONDS}s</b>\n\n"
+        "<b>🔍 Active quality filter:</b>\n"
+        f"  • Minimum confidence: <b>{min_conf}</b>\n"
+        f"  • Allowed actions: <b>{allowed_actions}</b>\n"
+        f"  • You will only receive <b>HIGH confidence BUY YES / BUY NO</b> alerts.\n\n"
         "<b>Detection thresholds:</b>\n"
         f"  • Odds shift: {config.ODDS_SHIFT_THRESHOLD*100:.0f}pp in 24h\n"
         f"  • Volume spike: {config.VOLUME_SPIKE_MULTIPLIER:.1f}× daily avg\n"
         f"  • Closing soon: within {config.CLOSING_SOON_HOURS}h\n"
         f"  • New markets: created within {config.NEW_MARKET_HOURS}h\n"
         f"  • Mispricing: ≥{config.MISPRICE_SUM_DEVIATION*100:.0f}pp deviation\n\n"
-        "<b>Alert format:</b>\n"
-        "  🟢 BUY YES / 🔴 BUY NO / 🟡 WATCH / ⚪ SKIP\n"
-        "  🔥 HIGH / 📌 MEDIUM / 💭 LOW confidence\n"
-        "  Bet size: SMALL / MEDIUM / LARGE\n\n"
         f"Topic filter: <i>{'all markets' if not config.TOPIC_KEYWORDS else config.TOPIC_KEYWORDS}</i>\n"
-        f"Alert cooldown: {config.ALERT_COOLDOWN_SECONDS // 60} minutes per market"
+        f"Alert cooldown: {config.ALERT_COOLDOWN_SECONDS // 60} minutes per market\n\n"
+        "<i>To adjust filters, update MIN_CONFIDENCE and ALLOWED_ACTIONS in your Railway environment variables.</i>"
     )
     loop = asyncio.new_event_loop()
     try:

@@ -5,8 +5,9 @@ bot.py — Main entry point for the Polymarket Alert Bot.
 Runs a continuous polling loop that:
   1. Fetches all active events and their markets from the Gamma API.
   2. Runs every detection strategy against the data.
-  3. Sends alerts to Telegram (or prints to console if not configured).
-  4. Sleeps for the configured interval and repeats.
+  3. Applies the quality filter (MIN_CONFIDENCE + ALLOWED_ACTIONS).
+  4. Sends qualifying alerts to Telegram (or prints to console if unconfigured).
+  5. Sleeps for the configured interval and repeats.
 
 Usage:
     python bot.py              # normal operation
@@ -26,7 +27,12 @@ import traceback
 import config
 from polymarket_client import fetch_active_events
 from detectors import run_all_detectors
-from telegram_alerts import send_alerts, send_startup_message, send_error_message
+from telegram_alerts import (
+    send_alerts,
+    send_startup_message,
+    send_error_message,
+    _passes_quality_filter,
+)
 
 # ── Logging setup ────────────────────────────────────────────────────────────
 
@@ -58,7 +64,7 @@ def scan_once(dry_run: bool = False) -> int:
     """
     Execute a single scan cycle.
 
-    Returns the number of alerts sent (or detected, if dry_run).
+    Returns the number of alerts sent (or that would be sent, if dry_run).
     """
     logger.info("Starting scan cycle...")
 
@@ -78,15 +84,23 @@ def scan_once(dry_run: bool = False) -> int:
         logger.info("No opportunities detected this cycle.")
         return 0
 
-    # 3. Send alerts
-    if dry_run:
-        logger.info("[DRY RUN] Would send %d alerts:", len(alerts))
-        for a in alerts:
-            logger.info("  • [%s] %s", a.signal_type, a.market_question)
-        return len(alerts)
+    # 3. Apply quality filter for reporting
+    qualified = [a for a in alerts if _passes_quality_filter(a)]
+    logger.info(
+        "Quality filter: %d raw alerts → %d pass (HIGH confidence + BUY YES/NO).",
+        len(alerts), len(qualified),
+    )
 
+    if dry_run:
+        logger.info("[DRY RUN] Would send %d alerts:", len(qualified))
+        for a in qualified:
+            logger.info("  • [%s] %s | %s | %s",
+                        a.signal_type, a.action, a.confidence, a.market_question)
+        return len(qualified)
+
+    # 4. Send (send_alerts applies the filter internally too)
     sent = send_alerts(alerts)
-    logger.info("Sent %d / %d alerts to Telegram.", sent, len(alerts))
+    logger.info("Sent %d alert(s) to Telegram.", sent)
     return sent
 
 
@@ -107,18 +121,19 @@ def main() -> None:
     logger.info("=" * 60)
     logger.info("  Polymarket Alert Bot starting")
     logger.info("=" * 60)
-    logger.info("  Poll interval : %ds", config.POLL_INTERVAL_SECONDS)
-    logger.info("  Odds shift    : %.0f%%", config.ODDS_SHIFT_THRESHOLD * 100)
-    logger.info("  Volume spike  : %.1fx", config.VOLUME_SPIKE_MULTIPLIER)
-    logger.info("  Closing soon  : %dh", config.CLOSING_SOON_HOURS)
-    logger.info("  New markets   : %dh", config.NEW_MARKET_HOURS)
-    logger.info("  Mispricing    : %.0f%%", config.MISPRICE_SUM_DEVIATION * 100)
-    logger.info("  Topic filter  : %s", config.TOPIC_KEYWORDS or "(all)")
-    logger.info("  Telegram      : %s",
+    logger.info("  Poll interval   : %ds", config.POLL_INTERVAL_SECONDS)
+    logger.info("  Odds shift      : %.0f%%", config.ODDS_SHIFT_THRESHOLD * 100)
+    logger.info("  Volume spike    : %.1fx", config.VOLUME_SPIKE_MULTIPLIER)
+    logger.info("  Closing soon    : %dh", config.CLOSING_SOON_HOURS)
+    logger.info("  New markets     : %dh", config.NEW_MARKET_HOURS)
+    logger.info("  Mispricing      : %.0f%%", config.MISPRICE_SUM_DEVIATION * 100)
+    logger.info("  Topic filter    : %s", config.TOPIC_KEYWORDS or "(all)")
+    logger.info("  Min confidence  : %s", config.MIN_CONFIDENCE)
+    logger.info("  Allowed actions : %s", config.ALLOWED_ACTIONS)
+    logger.info("  Telegram        : %s",
                 "configured" if config.TELEGRAM_BOT_TOKEN else "NOT configured (console mode)")
     logger.info("=" * 60)
 
-    # Send startup notification
     if not args.dry_run:
         send_startup_message()
 
@@ -137,14 +152,12 @@ def main() -> None:
             tb = traceback.format_exc()
             logger.error("Scan cycle failed (attempt %d):\n%s", consecutive_errors, tb)
 
-            # Notify via Telegram on first error, then back off.
             if consecutive_errors == 1:
                 try:
                     send_error_message(tb[-500:])
                 except Exception:
                     pass
 
-            # Exponential back-off on repeated failures (max 10 min).
             backoff = min(60 * (2 ** (consecutive_errors - 1)), 600)
             logger.info("Backing off for %ds before retrying.", backoff)
             _interruptible_sleep(backoff)
@@ -156,7 +169,6 @@ def main() -> None:
 
 
 def _interruptible_sleep(seconds: float) -> None:
-    """Sleep that can be interrupted by the shutdown signal."""
     end = time.time() + seconds
     while _running and time.time() < end:
         time.sleep(min(1, end - time.time()))

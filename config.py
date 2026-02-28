@@ -80,6 +80,13 @@ MIN_CONFIDENCE: str = os.getenv("MIN_CONFIDENCE", "HIGH")
 #   Set to "BUY YES,BUY NO,WATCH" to also receive watch alerts.
 ALLOWED_ACTIONS: str = os.getenv("ALLOWED_ACTIONS", "BUY YES,BUY NO")
 
+# ── Daily Alert Cap ─────────────────────────────────────────────────────────
+# Maximum number of alerts to send per calendar day (UTC midnight resets).
+# The bot will rank all qualifying opportunities by edge strength and only
+# send the best ones up to this limit.  Set to 0 to disable the cap.
+# Default: 5 — only the top 5 opportunities per day.
+MAX_ALERTS_PER_DAY: int = int(os.getenv("MAX_ALERTS_PER_DAY", "5"))
+
 # ── Alert Cooldown ───────────────────────────────────────────────────────────
 # Minimum seconds between repeated alerts for the *same* market + signal type.
 ALERT_COOLDOWN_SECONDS: int = int(os.getenv("ALERT_COOLDOWN_SECONDS", "3600"))
